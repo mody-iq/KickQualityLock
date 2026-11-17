@@ -1,76 +1,182 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 
 static UILabel *gLabel = nil;
+static NSUInteger gPeakSetCount = 0;
+static NSUInteger gResSetCount = 0;
+static double gLastPeakSet = -1.0;
+static CGSize gLastResSet = {-1.0, -1.0};
+static NSString *gSubclasses = nil;
+static __weak AVAsset *gVariantsAsset = nil;
 
-static UIWindow *KQLKeyWindow(void) {
-    UIWindow *result = nil;
+%hook AVPlayerItem
+
+- (void)setPreferredPeakBitRate:(double)rate {
+    gPeakSetCount++;
+    gLastPeakSet = rate;
+    NSLog(@"[KickQualityLock] setPreferredPeakBitRate: %.0f", rate);
+    %orig(rate);
+}
+
+- (void)setPreferredMaximumResolution:(CGSize)size {
+    gResSetCount++;
+    gLastResSet = size;
+    NSLog(@"[KickQualityLock] setPreferredMaximumResolution: %.0fx%.0f", size.width, size.height);
+    %orig(size);
+}
+
+%end
+
+static NSArray<UIWindow *> *KQLWindows(void) {
+    NSMutableArray *list = [NSMutableArray array];
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-            if (w.isKeyWindow) { result = w; break; }
+            [list addObject:w];
         }
-        if (result) break;
     }
-    return result;
+    return list;
 }
 
-static NSString *KQLBuildReport(void) {
-    NSMutableString *out = [NSMutableString stringWithString:@"KQL v3"];
+static UIWindow *KQLKeyWindow(void) {
+    for (UIWindow *w in KQLWindows()) {
+        if (w.isKeyWindow) return w;
+    }
+    return nil;
+}
+
+static AVPlayerLayer *KQLFindPlayerLayer(CALayer *layer, int depth) {
+    if (!layer || depth > 60) return nil;
+    if ([layer isKindOfClass:[AVPlayerLayer class]]) {
+        AVPlayerLayer *pl = (AVPlayerLayer *)layer;
+        if (pl.player) return pl;
+    }
+    for (CALayer *sub in [layer.sublayers copy]) {
+        AVPlayerLayer *found = KQLFindPlayerLayer(sub, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static NSString *KQLFindSubclasses(void) {
+    NSMutableArray *names = [NSMutableArray array];
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
-    NSMutableArray *ivs = [NSMutableArray array];
-    NSMutableArray *players = [NSMutableArray array];
-
+    Class avPlayer = [AVPlayer class];
+    Class avItem = [AVPlayerItem class];
     for (unsigned int i = 0; i < count; i++) {
-        const char *cname = class_getName(classes[i]);
+        Class c = classes[i];
+        if (c == avPlayer || c == avItem) continue;
+        const char *cname = class_getName(c);
         if (!cname) continue;
-        NSString *n = [NSString stringWithUTF8String:cname];
-        if (!n) continue;
-        if ([n hasPrefix:@"IVS"]) {
-            [ivs addObject:n];
-        } else if ([n rangeOfString:@"Player" options:NSCaseInsensitiveSearch].location != NSNotFound
-                   && ![n hasPrefix:@"AV"] && ![n hasPrefix:@"UI"] && ![n hasPrefix:@"NS"]
-                   && ![n hasPrefix:@"_"] && ![n hasPrefix:@"CA"] && ![n hasPrefix:@"MP"]) {
-            [players addObject:n];
+        if (strncmp(cname, "NSKVONotifying_", 15) == 0) continue;
+        Class s = class_getSuperclass(c);
+        int guard = 0;
+        while (s && guard < 12) {
+            if (s == avPlayer || s == avItem) {
+                [names addObject:[NSString stringWithUTF8String:cname]];
+                break;
+            }
+            s = class_getSuperclass(s);
+            guard++;
         }
     }
     free(classes);
+    [names sortUsingSelector:@selector(compare:)];
+    if (names.count == 0) return @"none";
+    NSUInteger n = MIN((NSUInteger)6, names.count);
+    return [[names subarrayWithRange:NSMakeRange(0, n)] componentsJoinedByString:@"\n  "];
+}
 
-    [ivs sortUsingSelector:@selector(compare:)];
-    [players sortUsingSelector:@selector(compare:)];
+static NSString *KQLShort(NSString *s, NSUInteger max) {
+    if (!s) return @"nil";
+    if (s.length <= max) return s;
+    return [[s substringToIndex:max] stringByAppendingString:@"..."];
+}
 
-    [out appendFormat:@"\nIVS classes: %lu", (unsigned long)ivs.count];
-    NSUInteger maxIvs = MIN((NSUInteger)10, ivs.count);
-    for (NSUInteger i = 0; i < maxIvs; i++) {
-        [out appendFormat:@"\n  %@", ivs[i]];
+static NSString *KQLBuildReport(void) {
+    NSMutableString *out = [NSMutableString stringWithString:@"KQL v4"];
+
+    if (!gSubclasses) gSubclasses = KQLFindSubclasses();
+
+    AVPlayerLayer *pl = nil;
+    for (UIWindow *w in KQLWindows()) {
+        pl = KQLFindPlayerLayer(w.layer, 0);
+        if (pl) break;
     }
 
-    [out appendFormat:@"\nPlayer-like classes: %lu", (unsigned long)players.count];
-    NSUInteger maxPl = MIN((NSUInteger)12, players.count);
-    for (NSUInteger i = 0; i < maxPl; i++) {
-        [out appendFormat:@"\n  %@", players[i]];
+    [out appendFormat:@"\nsetPeak calls: %lu last: %.0f", (unsigned long)gPeakSetCount, gLastPeakSet];
+    [out appendFormat:@"\nsetRes calls: %lu last: %.0fx%.0f", (unsigned long)gResSetCount, gLastResSet.width, gLastResSet.height];
+    [out appendFormat:@"\nAV subclasses:\n  %@", gSubclasses];
+
+    if (!pl) {
+        [out appendString:@"\nAVPlayerLayer: NOT FOUND"];
+        return out;
     }
 
-    Class ivsPlayer = NSClassFromString(@"IVSPlayer");
-    if (ivsPlayer) {
-        [out appendString:@"\nIVSPlayer methods:"];
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(ivsPlayer, &mcount);
-        NSUInteger shown = 0;
-        for (unsigned int i = 0; i < mcount && shown < 16; i++) {
-            NSString *sel = NSStringFromSelector(method_getName(methods[i]));
-            if ([sel rangeOfString:@"uality" options:NSCaseInsensitiveSearch].location != NSNotFound
-                || [sel rangeOfString:@"auto" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                [out appendFormat:@"\n  %@", sel];
-                shown++;
+    AVPlayer *player = pl.player;
+    AVPlayerItem *item = player.currentItem;
+    [out appendFormat:@"\nplayer: %s rate: %.1f", class_getName([player class]), player.rate];
+
+    if (!item) {
+        [out appendString:@"\nitem: nil"];
+        return out;
+    }
+
+    [out appendFormat:@"\nitem: %s", class_getName([item class])];
+
+    AVAsset *asset = item.asset;
+    if ([asset isKindOfClass:[AVURLAsset class]]) {
+        NSString *u = ((AVURLAsset *)asset).URL.absoluteString;
+        [out appendFormat:@"\nurl: %@", KQLShort(u, 90)];
+    }
+
+    CGSize cap = item.preferredMaximumResolution;
+    CGSize pres = item.presentationSize;
+    [out appendFormat:@"\ncap peak: %.0f  cap res: %.0fx%.0f", item.preferredPeakBitRate, cap.width, cap.height];
+    [out appendFormat:@"\nplaying res: %.0fx%.0f", pres.width, pres.height];
+
+    if (@available(iOS 15.0, *)) {
+        [out appendFormat:@"\nexpensive cap peak: %.0f res: %.0fx%.0f",
+            item.preferredPeakBitRateForExpensiveNetworks,
+            item.preferredMaximumResolutionForExpensiveNetworks.width,
+            item.preferredMaximumResolutionForExpensiveNetworks.height];
+    }
+
+    AVPlayerItemAccessLogEvent *ev = item.accessLog.events.lastObject;
+    if (ev) {
+        [out appendFormat:@"\nindicated: %.0f observed: %.0f switch: %.0f",
+            ev.indicatedBitrate, ev.observedBitrate, ev.switchBitrate];
+    } else {
+        [out appendString:@"\naccessLog: empty"];
+    }
+
+    if (@available(iOS 15.0, *)) {
+        if (asset) {
+            NSError *err = nil;
+            AVKeyValueStatus st = [asset statusOfValueForKey:@"variants" error:&err];
+            if (st == AVKeyValueStatusLoaded) {
+                NSArray<AVAssetVariant *> *vs = asset.variants;
+                [out appendFormat:@"\nvariants: %lu", (unsigned long)vs.count];
+                NSUInteger shown = 0;
+                for (AVAssetVariant *v in vs) {
+                    if (shown >= 8) break;
+                    CGSize s = v.videoAttributes ? v.videoAttributes.presentationSize : CGSizeZero;
+                    [out appendFormat:@"\n  %.0fx%.0f @ %.0f", s.width, s.height, v.peakBitRate];
+                    shown++;
+                }
+            } else if (gVariantsAsset != asset) {
+                gVariantsAsset = asset;
+                [asset loadValuesAsynchronouslyForKeys:@[@"variants"] completionHandler:^{}];
+                [out appendString:@"\nvariants: loading"];
+            } else {
+                [out appendFormat:@"\nvariants status: %ld", (long)st];
             }
         }
-        if (methods) free(methods);
-    } else {
-        [out appendString:@"\nIVSPlayer: not found"];
     }
     return out;
 }
@@ -97,7 +203,7 @@ static void KQLUpdateOverlay(void) {
         [win bringSubviewToFront:gLabel];
         gLabel.text = KQLBuildReport();
         CGSize s = [gLabel sizeThatFits:CGSizeMake(w, 2000)];
-        gLabel.frame = CGRectMake(8, 60, w, MIN(s.height, 520));
+        gLabel.frame = CGRectMake(8, 60, w, MIN(s.height, 560));
     } @catch (NSException *e) {
         NSLog(@"[KickQualityLock] overlay error: %@", e);
     }
@@ -109,7 +215,7 @@ static void KQLUpdateOverlay(void) {
         NSLog(@"[KickQualityLock] loaded on iOS %ld.%ld", (long)v.majorVersion, (long)v.minorVersion);
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer *t) {
+        [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
             KQLUpdateOverlay();
         }];
     });
