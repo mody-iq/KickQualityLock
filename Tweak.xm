@@ -140,13 +140,6 @@ static NSString *KQLBuildReport(void) {
     [out appendFormat:@"\ncap peak: %.0f  cap res: %.0fx%.0f", item.preferredPeakBitRate, cap.width, cap.height];
     [out appendFormat:@"\nplaying res: %.0fx%.0f", pres.width, pres.height];
 
-    if (@available(iOS 15.0, *)) {
-        [out appendFormat:@"\nexpensive cap peak: %.0f res: %.0fx%.0f",
-            item.preferredPeakBitRateForExpensiveNetworks,
-            item.preferredMaximumResolutionForExpensiveNetworks.width,
-            item.preferredMaximumResolutionForExpensiveNetworks.height];
-    }
-
     AVPlayerItemAccessLogEvent *ev = item.accessLog.events.lastObject;
     if (ev) {
         [out appendFormat:@"\nindicated: %.0f observed: %.0f switch: %.0f",
@@ -155,27 +148,42 @@ static NSString *KQLBuildReport(void) {
         [out appendString:@"\naccessLog: empty"];
     }
 
-    if (@available(iOS 15.0, *)) {
-        if (asset) {
-            NSError *err = nil;
-            AVKeyValueStatus st = [asset statusOfValueForKey:@"variants" error:&err];
-            if (st == AVKeyValueStatusLoaded) {
-                NSArray<AVAssetVariant *> *vs = asset.variants;
-                [out appendFormat:@"\nvariants: %lu", (unsigned long)vs.count];
-                NSUInteger shown = 0;
-                for (AVAssetVariant *v in vs) {
-                    if (shown >= 8) break;
-                    CGSize s = v.videoAttributes ? v.videoAttributes.presentationSize : CGSizeZero;
-                    [out appendFormat:@"\n  %.0fx%.0f @ %.0f", s.width, s.height, v.peakBitRate];
-                    shown++;
-                }
-            } else if (gVariantsAsset != asset) {
-                gVariantsAsset = asset;
-                [asset loadValuesAsynchronouslyForKeys:@[@"variants"] completionHandler:^{}];
-                [out appendString:@"\nvariants: loading"];
-            } else {
-                [out appendFormat:@"\nvariants status: %ld", (long)st];
+    if (asset) {
+        NSError *err = nil;
+        AVKeyValueStatus st = [asset statusOfValueForKey:@"variants" error:&err];
+        if (st == AVKeyValueStatusLoaded) {
+            NSArray *vs = nil;
+            @try {
+                vs = [asset valueForKey:@"variants"];
+            } @catch (NSException *e) {
+                vs = nil;
             }
+            [out appendFormat:@"\nvariants: %lu", (unsigned long)vs.count];
+            NSUInteger shown = 0;
+            for (id v in vs) {
+                if (shown >= 8) break;
+                double peak = 0.0;
+                CGSize s = CGSizeZero;
+                @try {
+                    id va = [v valueForKey:@"videoAttributes"];
+                    if (va) {
+                        id sv = [va valueForKey:@"presentationSize"];
+                        if ([sv isKindOfClass:[NSValue class]]) {
+                            s = [(NSValue *)sv CGSizeValue];
+                        }
+                    }
+                    peak = [[v valueForKey:@"peakBitRate"] doubleValue];
+                } @catch (NSException *e) {
+                }
+                [out appendFormat:@"\n  %.0fx%.0f @ %.0f", s.width, s.height, peak];
+                shown++;
+            }
+        } else if (gVariantsAsset != asset) {
+            gVariantsAsset = asset;
+            [asset loadValuesAsynchronouslyForKeys:@[@"variants"] completionHandler:^{}];
+            [out appendString:@"\nvariants: loading"];
+        } else {
+            [out appendFormat:@"\nvariants status: %ld", (long)st];
         }
     }
     return out;
