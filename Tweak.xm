@@ -4,9 +4,13 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 
+static NSString *const kKQLSavedKey = @"KQLSavedHeight";
+
 static UILabel *gLabel = nil;
 static NSUInteger gResSetCount = 0;
+static NSUInteger gResetCount = 0;
 static CGSize gLastResSet = {0.0, 0.0};
+static int gSavedHeight = 0;
 static NSUInteger gChunkCount = 0;
 static NSUInteger gMasterCount = 0;
 static NSUInteger gModifiedCount = 0;
@@ -44,7 +48,7 @@ static NSData *KQLRewriteMaster(NSData *data) {
     if ([text rangeOfString:@"#EXT-X-STREAM-INF"].location == NSNotFound) return data;
     gMasterCount++;
 
-    int targetH = (int)gLastResSet.height;
+    int targetH = gSavedHeight;
     if (targetH <= 0) return data;
 
     NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
@@ -109,7 +113,7 @@ static NSData *KQLRewriteMaster(NSData *data) {
 
     gModifiedCount++;
     gKeptHeight = best;
-    NSLog(@"[KickQualityLock] master playlist rewritten, kept %dp (cap %dp)", best, targetH);
+    NSLog(@"[KickQualityLock] master playlist rewritten, kept %dp (saved %dp)", best, targetH);
     return outData;
 }
 
@@ -131,8 +135,16 @@ static NSData *KQLRewriteMaster(NSData *data) {
 
 - (void)setPreferredMaximumResolution:(CGSize)size {
     gResSetCount++;
-    gLastResSet = size;
-    NSLog(@"[KickQualityLock] setPreferredMaximumResolution: %.0fx%.0f", size.width, size.height);
+    int h = (int)size.height;
+    if (h >= 100 && h <= 1080) {
+        gLastResSet = size;
+        gSavedHeight = h;
+        [[NSUserDefaults standardUserDefaults] setInteger:h forKey:kKQLSavedKey];
+        NSLog(@"[KickQualityLock] saved quality %dp", h);
+    } else {
+        gResetCount++;
+        NSLog(@"[KickQualityLock] ignored resolution cap %.0fx%.0f", size.width, size.height);
+    }
     %orig(size);
 }
 
@@ -171,9 +183,9 @@ static AVPlayerLayer *KQLFindPlayerLayer(CALayer *layer, int depth) {
 }
 
 static NSString *KQLBuildReport(void) {
-    NSMutableString *out = [NSMutableString stringWithString:@"KQL v5"];
-    [out appendFormat:@"\nsetRes calls: %lu last: %.0fx%.0f",
-        (unsigned long)gResSetCount, gLastResSet.width, gLastResSet.height];
+    NSMutableString *out = [NSMutableString stringWithString:@"KQL v6"];
+    [out appendFormat:@"\nsaved: %dp  setRes: %lu  ignored: %lu",
+        gSavedHeight, (unsigned long)gResSetCount, (unsigned long)gResetCount];
     [out appendFormat:@"\nplaylist chunks: %lu master: %lu",
         (unsigned long)gChunkCount, (unsigned long)gMasterCount];
     [out appendFormat:@"\nmodified: %lu kept: %dp",
@@ -239,6 +251,7 @@ static void KQLUpdateOverlay(void) {
     @autoreleasepool {
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
         NSLog(@"[KickQualityLock] loaded on iOS %ld.%ld", (long)v.majorVersion, (long)v.minorVersion);
+        gSavedHeight = (int)[[NSUserDefaults standardUserDefaults] integerForKey:kKQLSavedKey];
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
