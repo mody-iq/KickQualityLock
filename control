@@ -1,0 +1,9 @@
+Package: com.mody.kickqualitylock
+Name: KickQualityLock
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: Locks Kick video quality to the selected resolution and stops automatic downgrade.
+Maintainer: mody
+Author: mody
+Section: Tweaks
+Depends: mobilesubstrate
