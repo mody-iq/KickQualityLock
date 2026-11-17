@@ -5,21 +5,129 @@
 #import <objc/runtime.h>
 
 static UILabel *gLabel = nil;
-static NSUInteger gPeakSetCount = 0;
 static NSUInteger gResSetCount = 0;
-static double gLastPeakSet = -1.0;
-static CGSize gLastResSet = {-1.0, -1.0};
-static NSString *gSubclasses = nil;
-static __weak AVAsset *gVariantsAsset = nil;
+static CGSize gLastResSet = {0.0, 0.0};
+static NSUInteger gChunkCount = 0;
+static NSUInteger gMasterCount = 0;
+static NSUInteger gModifiedCount = 0;
+static int gKeptHeight = 0;
+
+static int KQLHeightFromInf(NSString *line) {
+    NSRange r = [line rangeOfString:@"RESOLUTION="];
+    if (r.location == NSNotFound) return 0;
+    NSUInteger i = r.location + r.length;
+    NSUInteger n = line.length;
+    while (i < n) {
+        unichar c = [line characterAtIndex:i];
+        if (c < '0' || c > '9') break;
+        i++;
+    }
+    if (i >= n || [line characterAtIndex:i] != 'x') return 0;
+    i++;
+    int h = 0;
+    while (i < n) {
+        unichar c = [line characterAtIndex:i];
+        if (c < '0' || c > '9') break;
+        h = h * 10 + (int)(c - '0');
+        i++;
+    }
+    return h;
+}
+
+static NSData *KQLRewriteMaster(NSData *data) {
+    if (!data || data.length < 20) return data;
+    gChunkCount++;
+
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!text) return data;
+    if (![text hasPrefix:@"#EXTM3U"]) return data;
+    if ([text rangeOfString:@"#EXT-X-STREAM-INF"].location == NSNotFound) return data;
+    gMasterCount++;
+
+    int targetH = (int)gLastResSet.height;
+    if (targetH <= 0) return data;
+
+    NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+    NSUInteger total = lines.count;
+
+    NSMutableArray<NSNumber *> *infIdx = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *uriIdx = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *heights = [NSMutableArray array];
+
+    for (NSUInteger i = 0; i < total; i++) {
+        NSString *line = [lines[i] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![line hasPrefix:@"#EXT-X-STREAM-INF:"]) continue;
+        NSUInteger j = i + 1;
+        NSInteger found = -1;
+        while (j < total) {
+            NSString *next = [lines[j] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (next.length > 0 && ![next hasPrefix:@"#"]) {
+                found = (NSInteger)j;
+                break;
+            }
+            if ([next hasPrefix:@"#EXT-X-STREAM-INF:"]) break;
+            j++;
+        }
+        if (found < 0) continue;
+        [infIdx addObject:@(i)];
+        [uriIdx addObject:@(found)];
+        [heights addObject:@(KQLHeightFromInf(line))];
+    }
+
+    if (infIdx.count < 2) return data;
+
+    int best = 0;
+    for (NSNumber *h in heights) {
+        int v = h.intValue;
+        if (v > 0 && v <= targetH && v > best) best = v;
+    }
+    if (best == 0) return data;
+
+    NSMutableIndexSet *remove = [NSMutableIndexSet indexSet];
+    for (NSUInteger k = 0; k < infIdx.count; k++) {
+        if (heights[k].intValue != best) {
+            [remove addIndex:infIdx[k].unsignedIntegerValue];
+            [remove addIndex:uriIdx[k].unsignedIntegerValue];
+        }
+    }
+    if (remove.count == 0) return data;
+
+    NSMutableArray<NSString *> *kept = [NSMutableArray arrayWithCapacity:total];
+    for (NSUInteger i = 0; i < total; i++) {
+        if (![remove containsIndex:i]) [kept addObject:lines[i]];
+    }
+    NSString *joined = [kept componentsJoinedByString:@"\n"];
+    NSMutableData *outData = [[joined dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+    if (!outData || outData.length > data.length) return data;
+
+    NSUInteger pad = data.length - outData.length;
+    if (pad > 0) {
+        NSMutableData *fill = [NSMutableData dataWithLength:pad];
+        memset(fill.mutableBytes, '\n', pad);
+        [outData appendData:fill];
+    }
+
+    gModifiedCount++;
+    gKeptHeight = best;
+    NSLog(@"[KickQualityLock] master playlist rewritten, kept %dp (cap %dp)", best, targetH);
+    return outData;
+}
+
+%hook AVAssetResourceLoadingDataRequest
+
+- (void)respondWithData:(NSData *)data {
+    NSData *out = data;
+    @try {
+        out = KQLRewriteMaster(data);
+    } @catch (NSException *e) {
+        out = data;
+    }
+    %orig(out);
+}
+
+%end
 
 %hook AVPlayerItem
-
-- (void)setPreferredPeakBitRate:(double)rate {
-    gPeakSetCount++;
-    gLastPeakSet = rate;
-    NSLog(@"[KickQualityLock] setPreferredPeakBitRate: %.0f", rate);
-    %orig(rate);
-}
 
 - (void)setPreferredMaximumResolution:(CGSize)size {
     gResSetCount++;
@@ -62,129 +170,39 @@ static AVPlayerLayer *KQLFindPlayerLayer(CALayer *layer, int depth) {
     return nil;
 }
 
-static NSString *KQLFindSubclasses(void) {
-    NSMutableArray *names = [NSMutableArray array];
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    Class avPlayer = [AVPlayer class];
-    Class avItem = [AVPlayerItem class];
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = classes[i];
-        if (c == avPlayer || c == avItem) continue;
-        const char *cname = class_getName(c);
-        if (!cname) continue;
-        if (strncmp(cname, "NSKVONotifying_", 15) == 0) continue;
-        Class s = class_getSuperclass(c);
-        int guard = 0;
-        while (s && guard < 12) {
-            if (s == avPlayer || s == avItem) {
-                [names addObject:[NSString stringWithUTF8String:cname]];
-                break;
-            }
-            s = class_getSuperclass(s);
-            guard++;
-        }
-    }
-    free(classes);
-    [names sortUsingSelector:@selector(compare:)];
-    if (names.count == 0) return @"none";
-    NSUInteger n = MIN((NSUInteger)6, names.count);
-    return [[names subarrayWithRange:NSMakeRange(0, n)] componentsJoinedByString:@"\n  "];
-}
-
-static NSString *KQLShort(NSString *s, NSUInteger max) {
-    if (!s) return @"nil";
-    if (s.length <= max) return s;
-    return [[s substringToIndex:max] stringByAppendingString:@"..."];
-}
-
 static NSString *KQLBuildReport(void) {
-    NSMutableString *out = [NSMutableString stringWithString:@"KQL v4"];
-
-    if (!gSubclasses) gSubclasses = KQLFindSubclasses();
+    NSMutableString *out = [NSMutableString stringWithString:@"KQL v5"];
+    [out appendFormat:@"\nsetRes calls: %lu last: %.0fx%.0f",
+        (unsigned long)gResSetCount, gLastResSet.width, gLastResSet.height];
+    [out appendFormat:@"\nplaylist chunks: %lu master: %lu",
+        (unsigned long)gChunkCount, (unsigned long)gMasterCount];
+    [out appendFormat:@"\nmodified: %lu kept: %dp",
+        (unsigned long)gModifiedCount, gKeptHeight];
 
     AVPlayerLayer *pl = nil;
     for (UIWindow *w in KQLWindows()) {
         pl = KQLFindPlayerLayer(w.layer, 0);
         if (pl) break;
     }
-
-    [out appendFormat:@"\nsetPeak calls: %lu last: %.0f", (unsigned long)gPeakSetCount, gLastPeakSet];
-    [out appendFormat:@"\nsetRes calls: %lu last: %.0fx%.0f", (unsigned long)gResSetCount, gLastResSet.width, gLastResSet.height];
-    [out appendFormat:@"\nAV subclasses:\n  %@", gSubclasses];
-
     if (!pl) {
         [out appendString:@"\nAVPlayerLayer: NOT FOUND"];
         return out;
     }
-
-    AVPlayer *player = pl.player;
-    AVPlayerItem *item = player.currentItem;
-    [out appendFormat:@"\nplayer: %s rate: %.1f", class_getName([player class]), player.rate];
-
+    AVPlayerItem *item = pl.player.currentItem;
     if (!item) {
         [out appendString:@"\nitem: nil"];
         return out;
     }
-
-    [out appendFormat:@"\nitem: %s", class_getName([item class])];
-
-    AVAsset *asset = item.asset;
-    if ([asset isKindOfClass:[AVURLAsset class]]) {
-        NSString *u = ((AVURLAsset *)asset).URL.absoluteString;
-        [out appendFormat:@"\nurl: %@", KQLShort(u, 90)];
-    }
-
     CGSize cap = item.preferredMaximumResolution;
     CGSize pres = item.presentationSize;
-    [out appendFormat:@"\ncap peak: %.0f  cap res: %.0fx%.0f", item.preferredPeakBitRate, cap.width, cap.height];
+    [out appendFormat:@"\ncap res: %.0fx%.0f", cap.width, cap.height];
     [out appendFormat:@"\nplaying res: %.0fx%.0f", pres.width, pres.height];
-
     AVPlayerItemAccessLogEvent *ev = item.accessLog.events.lastObject;
     if (ev) {
-        [out appendFormat:@"\nindicated: %.0f observed: %.0f switch: %.0f",
-            ev.indicatedBitrate, ev.observedBitrate, ev.switchBitrate];
+        [out appendFormat:@"\nindicated: %.0f observed: %.0f",
+            ev.indicatedBitrate, ev.observedBitrate];
     } else {
         [out appendString:@"\naccessLog: empty"];
-    }
-
-    if (asset) {
-        NSError *err = nil;
-        AVKeyValueStatus st = [asset statusOfValueForKey:@"variants" error:&err];
-        if (st == AVKeyValueStatusLoaded) {
-            NSArray *vs = nil;
-            @try {
-                vs = [asset valueForKey:@"variants"];
-            } @catch (NSException *e) {
-                vs = nil;
-            }
-            [out appendFormat:@"\nvariants: %lu", (unsigned long)vs.count];
-            NSUInteger shown = 0;
-            for (id v in vs) {
-                if (shown >= 8) break;
-                double peak = 0.0;
-                CGSize s = CGSizeZero;
-                @try {
-                    id va = [v valueForKey:@"videoAttributes"];
-                    if (va) {
-                        id sv = [va valueForKey:@"presentationSize"];
-                        if ([sv isKindOfClass:[NSValue class]]) {
-                            s = [(NSValue *)sv CGSizeValue];
-                        }
-                    }
-                    peak = [[v valueForKey:@"peakBitRate"] doubleValue];
-                } @catch (NSException *e) {
-                }
-                [out appendFormat:@"\n  %.0fx%.0f @ %.0f", s.width, s.height, peak];
-                shown++;
-            }
-        } else if (gVariantsAsset != asset) {
-            gVariantsAsset = asset;
-            [asset loadValuesAsynchronouslyForKeys:@[@"variants"] completionHandler:^{}];
-            [out appendString:@"\nvariants: loading"];
-        } else {
-            [out appendFormat:@"\nvariants status: %ld", (long)st];
-        }
     }
     return out;
 }
@@ -195,11 +213,11 @@ static void KQLUpdateOverlay(void) {
         if (!win) return;
         CGFloat w = win.bounds.size.width - 16.0;
         if (!gLabel) {
-            gLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, w, 300)];
+            gLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, w, 150)];
             gLabel.numberOfLines = 0;
-            gLabel.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightMedium];
+            gLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightMedium];
             gLabel.textColor = [UIColor greenColor];
-            gLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
+            gLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
             gLabel.userInteractionEnabled = NO;
             gLabel.layer.cornerRadius = 6;
             gLabel.clipsToBounds = YES;
@@ -210,8 +228,8 @@ static void KQLUpdateOverlay(void) {
         }
         [win bringSubviewToFront:gLabel];
         gLabel.text = KQLBuildReport();
-        CGSize s = [gLabel sizeThatFits:CGSizeMake(w, 2000)];
-        gLabel.frame = CGRectMake(8, 60, w, MIN(s.height, 560));
+        CGSize s = [gLabel sizeThatFits:CGSizeMake(w, 1000)];
+        gLabel.frame = CGRectMake(8, 60, w, MIN(s.height, 300));
     } @catch (NSException *e) {
         NSLog(@"[KickQualityLock] overlay error: %@", e);
     }
