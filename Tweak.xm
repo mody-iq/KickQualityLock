@@ -1,18 +1,55 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
-#import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
 
-#define KQL_TARGET_HEIGHT 1080
-#define KQL_SHOW_OVERLAY 1
+static NSString *const kKQLModeKey = @"KQLModeIndex";
+static const int kKQLHeights[4] = {1080, 720, 480, 0};
+static NSString *const kKQLTitles[4] = {@"1080p", @"720p", @"480p", @"OFF"};
 
-static NSUInteger gResSetCount = 0;
-static CGSize gLastResSet = {0.0, 0.0};
-static NSUInteger gChunkCount = 0;
-static NSUInteger gMasterCount = 0;
-static NSUInteger gModifiedCount = 0;
-static int gKeptHeight = 0;
+static NSInteger gModeIndex = 0;
+static UIButton *gButton = nil;
+static id gHelper = nil;
+
+static void KQLRefreshTitle(void) {
+    if (!gButton) return;
+    NSInteger i = gModeIndex;
+    if (i < 0 || i > 3) i = 0;
+    [gButton setTitle:kKQLTitles[i] forState:UIControlStateNormal];
+    UIColor *c = (kKQLHeights[i] == 0) ? [UIColor lightGrayColor] : [UIColor greenColor];
+    [gButton setTitleColor:c forState:UIControlStateNormal];
+    gButton.layer.borderColor = c.CGColor;
+}
+
+@interface KQLHelper : NSObject
+- (void)onTap:(UIButton *)sender;
+- (void)onPan:(UIPanGestureRecognizer *)pan;
+@end
+
+@implementation KQLHelper
+
+- (void)onTap:(UIButton *)sender {
+    gModeIndex = (gModeIndex + 1) % 4;
+    [[NSUserDefaults standardUserDefaults] setInteger:gModeIndex forKey:kKQLModeKey];
+    KQLRefreshTitle();
+    NSLog(@"[KickQualityLock] mode changed to %@", kKQLTitles[gModeIndex]);
+}
+
+- (void)onPan:(UIPanGestureRecognizer *)pan {
+    UIView *v = pan.view;
+    UIView *sup = v.superview;
+    if (!v || !sup) return;
+    CGPoint t = [pan translationInView:sup];
+    CGFloat hw = v.bounds.size.width / 2.0;
+    CGFloat hh = v.bounds.size.height / 2.0;
+    CGPoint c = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    c.x = MAX(hw, MIN(sup.bounds.size.width - hw, c.x));
+    c.y = MAX(hh + 40.0, MIN(sup.bounds.size.height - hh, c.y));
+    v.center = c;
+    [pan setTranslation:CGPointZero inView:sup];
+}
+
+@end
 
 static int KQLHeightFromInf(NSString *line) {
     NSRange r = [line rangeOfString:@"RESOLUTION="];
@@ -38,15 +75,16 @@ static int KQLHeightFromInf(NSString *line) {
 
 static NSData *KQLRewriteMaster(NSData *data) {
     if (!data || data.length < 20) return data;
-    gChunkCount++;
+
+    NSInteger mode = gModeIndex;
+    if (mode < 0 || mode > 3) mode = 0;
+    int targetH = kKQLHeights[mode];
+    if (targetH <= 0) return data;
 
     NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!text) return data;
     if (![text hasPrefix:@"#EXTM3U"]) return data;
     if ([text rangeOfString:@"#EXT-X-STREAM-INF"].location == NSNotFound) return data;
-    gMasterCount++;
-
-    int targetH = KQL_TARGET_HEIGHT;
 
     NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
     NSUInteger total = lines.count;
@@ -108,8 +146,6 @@ static NSData *KQLRewriteMaster(NSData *data) {
         [outData appendData:fill];
     }
 
-    gModifiedCount++;
-    gKeptHeight = best;
     NSLog(@"[KickQualityLock] master playlist rewritten, kept %dp (target %dp)", best, targetH);
     return outData;
 }
@@ -128,131 +164,56 @@ static NSData *KQLRewriteMaster(NSData *data) {
 
 %end
 
-%hook AVPlayerItem
-
-- (void)setPreferredMaximumResolution:(CGSize)size {
-    gResSetCount++;
-    gLastResSet = size;
-    NSLog(@"[KickQualityLock] app set resolution cap %.0fx%.0f", size.width, size.height);
-    %orig(size);
-}
-
-%end
-
-#if KQL_SHOW_OVERLAY
-
-static UILabel *gLabel = nil;
-
-static NSArray<UIWindow *> *KQLWindows(void) {
-    NSMutableArray *list = [NSMutableArray array];
+static UIWindow *KQLKeyWindow(void) {
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (![scene isKindOfClass:[UIWindowScene class]]) continue;
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
         for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-            [list addObject:w];
+            if (w.isKeyWindow) return w;
         }
     }
-    return list;
-}
-
-static UIWindow *KQLKeyWindow(void) {
-    for (UIWindow *w in KQLWindows()) {
-        if (w.isKeyWindow) return w;
-    }
     return nil;
 }
 
-static AVPlayerLayer *KQLFindPlayerLayer(CALayer *layer, int depth) {
-    if (!layer || depth > 60) return nil;
-    if ([layer isKindOfClass:[AVPlayerLayer class]]) {
-        AVPlayerLayer *pl = (AVPlayerLayer *)layer;
-        if (pl.player) return pl;
-    }
-    for (CALayer *sub in [layer.sublayers copy]) {
-        AVPlayerLayer *found = KQLFindPlayerLayer(sub, depth + 1);
-        if (found) return found;
-    }
-    return nil;
-}
-
-static NSString *KQLBuildReport(void) {
-    NSMutableString *out = [NSMutableString stringWithString:@"KQL v7"];
-    [out appendFormat:@"\ntarget: %dp  app cap calls: %lu last: %.0fx%.0f",
-        KQL_TARGET_HEIGHT, (unsigned long)gResSetCount, gLastResSet.width, gLastResSet.height];
-    [out appendFormat:@"\nplaylist chunks: %lu master: %lu",
-        (unsigned long)gChunkCount, (unsigned long)gMasterCount];
-    [out appendFormat:@"\nmodified: %lu kept: %dp",
-        (unsigned long)gModifiedCount, gKeptHeight];
-
-    AVPlayerLayer *pl = nil;
-    for (UIWindow *w in KQLWindows()) {
-        pl = KQLFindPlayerLayer(w.layer, 0);
-        if (pl) break;
-    }
-    if (!pl) {
-        [out appendString:@"\nAVPlayerLayer: NOT FOUND"];
-        return out;
-    }
-    AVPlayerItem *item = pl.player.currentItem;
-    if (!item) {
-        [out appendString:@"\nitem: nil"];
-        return out;
-    }
-    CGSize cap = item.preferredMaximumResolution;
-    CGSize pres = item.presentationSize;
-    [out appendFormat:@"\ncap res: %.0fx%.0f", cap.width, cap.height];
-    [out appendFormat:@"\nplaying res: %.0fx%.0f", pres.width, pres.height];
-    AVPlayerItemAccessLogEvent *ev = item.accessLog.events.lastObject;
-    if (ev) {
-        [out appendFormat:@"\nindicated: %.0f observed: %.0f",
-            ev.indicatedBitrate, ev.observedBitrate];
-    } else {
-        [out appendString:@"\naccessLog: empty"];
-    }
-    return out;
-}
-
-static void KQLUpdateOverlay(void) {
+static void KQLTick(void) {
     @try {
         UIWindow *win = KQLKeyWindow();
         if (!win) return;
-        CGFloat w = win.bounds.size.width - 16.0;
-        if (!gLabel) {
-            gLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, w, 150)];
-            gLabel.numberOfLines = 0;
-            gLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightMedium];
-            gLabel.textColor = [UIColor greenColor];
-            gLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
-            gLabel.userInteractionEnabled = NO;
-            gLabel.layer.cornerRadius = 6;
-            gLabel.clipsToBounds = YES;
+        if (!gHelper) gHelper = [[KQLHelper alloc] init];
+        if (!gButton) {
+            gButton = [UIButton buttonWithType:UIButtonTypeCustom];
+            gButton.frame = CGRectMake(8.0, 275.0, 56.0, 26.0);
+            gButton.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+            gButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+            gButton.layer.cornerRadius = 8.0;
+            gButton.layer.borderWidth = 1.0;
+            gButton.clipsToBounds = YES;
+            [gButton addTarget:gHelper action:@selector(onTap:) forControlEvents:UIControlEventTouchUpInside];
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gHelper action:@selector(onPan:)];
+            [gButton addGestureRecognizer:pan];
         }
-        if (gLabel.superview != win) {
-            [gLabel removeFromSuperview];
-            [win addSubview:gLabel];
+        if (gButton.superview != win) {
+            [gButton removeFromSuperview];
+            [win addSubview:gButton];
         }
-        [win bringSubviewToFront:gLabel];
-        gLabel.text = KQLBuildReport();
-        CGSize s = [gLabel sizeThatFits:CGSizeMake(w, 1000)];
-        gLabel.frame = CGRectMake(8, 60, w, MIN(s.height, 300));
+        [win bringSubviewToFront:gButton];
+        KQLRefreshTitle();
     } @catch (NSException *e) {
-        NSLog(@"[KickQualityLock] overlay error: %@", e);
+        NSLog(@"[KickQualityLock] button error: %@", e);
     }
 }
-
-#endif
 
 %ctor {
     @autoreleasepool {
         NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
-        NSLog(@"[KickQualityLock] loaded on iOS %ld.%ld, target %dp",
-              (long)v.majorVersion, (long)v.minorVersion, KQL_TARGET_HEIGHT);
+        gModeIndex = [[NSUserDefaults standardUserDefaults] integerForKey:kKQLModeKey];
+        if (gModeIndex < 0 || gModeIndex > 3) gModeIndex = 0;
+        NSLog(@"[KickQualityLock] loaded on iOS %ld.%ld, mode %@",
+              (long)v.majorVersion, (long)v.minorVersion, kKQLTitles[gModeIndex]);
     }
-#if KQL_SHOW_OVERLAY
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
-            KQLUpdateOverlay();
+            KQLTick();
         }];
     });
-#endif
 }
